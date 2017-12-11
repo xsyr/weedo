@@ -14,24 +14,16 @@ import (
 )
 
 type Volume struct {
-	Locations []Location
+	Location Location
 }
 
-func NewVolume(locations []Location) *Volume {
-	for i, _ := range locations {
-		if !strings.HasPrefix(locations[i].Url, "http:") {
-			locations[i].Url = fmt.Sprintf("http://%s", locations[i].Url)
-		}
-		if !strings.HasPrefix(locations[i].PublicUrl, "http:") {
-			locations[i].PublicUrl = fmt.Sprintf("http://%s", locations[i].PublicUrl)
-		}
-	}
-	return &Volume{Locations: locations}
+func NewVolume(l Location) *Volume {
+	return &Volume{ Location: l }
 }
 
 // Upload File
 func (v *Volume) Upload(fid string, version int, filename, mimeType string, file io.Reader) (size int64, err error) {
-	url := fmt.Sprintf("%s/%s", v.PublicUrl(), fid) // http://localhost:8080/3,7363da54ae
+	url := fmt.Sprintf("%s/%s", v.Url(), fid) // http://localhost:8080/3,7363da54ae
 	if version > 0 {
 		url = fmt.Sprintf("%s_%d", url, version) // http://localhost:8080/3,7363da54ae_1
 	}
@@ -50,6 +42,7 @@ func (v *Volume) Upload(fid string, version int, filename, mimeType string, file
 }
 
 // Upload File Directly
+/*
 func (v *Volume) Submit(filename, mimeType string, file io.Reader) (fid string, size int64, err error) {
 	data, contentType, err := makeFormData(filename, mimeType, file)
 	if err != nil {
@@ -57,12 +50,13 @@ func (v *Volume) Submit(filename, mimeType string, file io.Reader) (fid string, 
 	}
 	resp, err := upload(v.PublicUrl()+"/submit", contentType, data)
 	if err == nil {
-		fid = resp.Fid
+		fid  = resp.Fid
 		size = resp.Size
 	}
 
 	return
 }
+*/
 
 // Delete File
 func (v *Volume) Delete(fid string, count int) (err error) {
@@ -96,17 +90,17 @@ func (v *Volume) AssignVolume(volumeId uint64, replica string) error {
 }
 
 func (v *Volume) Url() string {
-	if len(v.Locations) == 0 {
-		return ""
-	}
-	return v.Locations[0].Url
+    if !strings.HasPrefix(v.Location.Url, "http:") {
+        return "http://" + v.Location.Url
+    }
+    return v.Location.Url
 }
 
 func (v *Volume) PublicUrl() string {
-	if len(v.Locations) == 0 {
-		return ""
-	}
-	return v.Locations[0].PublicUrl
+    if !strings.HasPrefix(v.Location.PublicUrl, "http:") {
+        return "http://" + v.Location.PublicUrl
+    }
+	return v.Location.PublicUrl
 }
 
 type volumeStatus struct {

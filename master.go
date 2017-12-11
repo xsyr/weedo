@@ -2,22 +2,76 @@
 package weedo
 
 import (
-	"errors"
+    "errors"
+    "time"
 	"io"
 	"log"
 	"net/http"
 	"net/url"
 	"strconv"
+    "sync"
 )
+
+var ErrVolumeLocationNotFound = errors.New("Location not found.")
+
+type SystemStatus struct {
+	Topology Topology
+	Version  string
+}
+
+type Topology struct {
+	DataCenters []DataCenter
+	Free        int
+	Max         int
+    Layouts     []Layout `json:"layouts"`
+}
+
+type DataCenter struct {
+	Free  int
+	Max   int
+    Id    string
+	Racks []Rack
+}
+
+type Rack struct {
+	DataNodes []DataNode
+	Free      int
+	Max       int
+    Id        string
+}
+
+type DataNode struct {
+	Free      int
+	Max       int
+	PublicUrl string
+	Url       string
+	Volumes   int
+}
+
+type Layout struct {
+    Collection  string `json:"collection"`
+    Replication string `json:"replication"`
+    TTL         string `json:"ttl"`
+    Writables   []uint64 `json:"writables"`
+}
+
 
 type Master struct {
 	Url string
+
+    done chan struct{}
+    mtx sync.Mutex
+    volDcMap map[string]string
 }
 
-func NewMaster(addr string) *Master {
-	return &Master{
+func NewMaster(addr string) (*Master, error) {
+    m := &Master{
 		Url: addr,
+
+        done : make(chan struct{}),
 	}
+    go m.updateTopo()
+    return m, nil
 }
 
 // Assign a file key
@@ -36,12 +90,10 @@ func (m *Master) AssignN(count int) (fid string, err error) {
 }
 
 type assignResp struct {
-	Count     int
-	Fid       string
-	Url       string
-	PublicUrl string
-	Size      int64
-	Error     string
+    Count     int    `json:"count"`
+    Fid       string `json:"fid"`
+    Url       string `json:"url"`
+    PublicUrl string `json:"publicUrl"`
 }
 
 // v0.4 or later only
@@ -65,29 +117,37 @@ func (m *Master) AssignArgs(args url.Values) (fid string, err error) {
 		return
 	}
 
-	if assign.Error != "" {
-		err = errors.New(assign.Error)
-		log.Println(err)
-		return
-	}
-
 	fid = assign.Fid
 
 	return
 }
 
 type lookupResp struct {
-	Locations []Location
-	Error     string
+    Locations []Location `json:"locations"`
+    VolumeId     string `json:"volumeId"`
+    Error        string `json:"error"`
 }
 
 type Location struct {
-	Url       string
-	PublicUrl string
+    Url       string `json:"url"`
+    PublicUrl string `json:"publicUrl"`
+}
+
+func (m *Master) lookupNearestNode(lr *lookupResp, dc string) Location {
+    m.mtx.Lock()
+    defer m.mtx.Unlock()
+
+    for _, l := range lr.Locations {
+        if m.volDcMap[l.Url] == dc {
+            return l
+        }
+    }
+
+    return lr.Locations[0]
 }
 
 // Lookup Volume
-func (m *Master) lookup(volumeId, collection string) (*Volume, error) {
+func (m *Master) Lookup(volumeId, collection, dc string) (*Volume, error) {
 	args := url.Values{}
 	args.Set("volumeId", volumeId)
 	args.Set("collection", collection)
@@ -110,11 +170,15 @@ func (m *Master) lookup(volumeId, collection string) (*Volume, error) {
 		return nil, err
 	}
 
-	if lookup.Error != "" {
-		return nil, errors.New(lookup.Error)
-	}
+    if len(lookup.Error) != 0 {
+        return nil, errors.New(lookup.Error)
+    }
 
-	return NewVolume(lookup.Locations), nil
+    if len(lookup.Locations) == 0 {
+        return nil, ErrVolumeLocationNotFound
+    }
+
+    return NewVolume(m.lookupNearestNode(lookup, dc)), nil
 }
 
 // Force Garbage Collection
@@ -190,46 +254,8 @@ func (m *Master) SubmitArgs(filename, mimeType string, file io.Reader, args url.
 	return
 }
 
-type systemStatus struct {
-	Topology topology
-	Version  string
-	Error    string
-}
-
-type topology struct {
-	DataCenters []dataCenter
-	Free        int
-	Max         int
-	Layouts     []layout
-}
-
-type dataCenter struct {
-	Free  int
-	Max   int
-	Racks []rack
-}
-
-type rack struct {
-	DataNodes []dataNode
-	Free      int
-	Max       int
-}
-
-type dataNode struct {
-	Free      int
-	Max       int
-	PublicUrl string
-	Url       string
-	Volumes   int
-}
-
-type layout struct {
-	Replication string
-	Writables   []uint64
-}
-
 // Check System Status
-func (m *Master) Status() (err error) {
+func (m *Master) Status() (*SystemStatus, error) {
 	u := url.URL{
 		Scheme: "http",
 		Host:   m.Url,
@@ -237,21 +263,54 @@ func (m *Master) Status() (err error) {
 	}
 	resp, err := http.Get(u.String())
 	if err != nil {
-		return
+		return nil, err
 	}
 
 	defer resp.Body.Close()
 
-	status := new(systemStatus)
+	status := new(SystemStatus)
 	if err = decodeJson(resp.Body, status); err != nil {
 		log.Println(err)
-		return
+		return nil, err
 	}
 
-	if status.Error != "" {
-		err = errors.New(status.Error)
-		log.Println(err)
-		return
-	}
-	return
+	return status, nil
 }
+
+func (m *Master) updateTopo() {
+    timeout := time.Tick(1 * time.Second)
+
+    LOOP:
+    for {
+        select {
+        case <-m.done: break LOOP
+        case <-timeout:
+        }
+
+        s, err := m.Status()
+        if err != nil {
+            log.Println(err)
+            continue
+        }
+
+        volDcMap := make(map[string]string)
+        for _, d := range s.Topology.DataCenters {
+            for _, r := range d.Racks {
+                for _, n := range r.DataNodes {
+                    volDcMap[n.Url] = d.Id
+                }
+            }
+        }
+
+        m.mtx.Lock()
+        m.volDcMap = volDcMap
+        m.mtx.Unlock()
+    }
+    m.done<-struct{}{}
+}
+
+func (m *Master) close() {
+    m.done<-struct{}{}
+    <-m.done
+}
+

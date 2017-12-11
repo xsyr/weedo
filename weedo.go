@@ -17,11 +17,8 @@ import (
 	"strings"
 )
 
-var defaultClient *Client
-
 func init() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
-	defaultClient = NewClient("localhost:9333")
 }
 
 type Fid struct {
@@ -30,48 +27,40 @@ type Fid struct {
 
 type Client struct {
 	master  *Master
-	volumes map[uint64]*Volume
 	filers  map[string]*Filer
 }
 
-func NewClient(masterAddr string, filerUrls ...string) *Client {
+func NewClient(masterAddr string, filerUrls ...string) (*Client, error) {
 	filers := make(map[string]*Filer)
 	for _, url := range filerUrls {
 		filer := NewFiler(url)
 		filers[filer.Url] = filer
 	}
+    m, err := NewMaster(masterAddr)
+    if err != nil {
+        return nil, err
+    }
 	return &Client{
-		master:  NewMaster(masterAddr),
-		volumes: make(map[uint64]*Volume),
+		master:  m,
 		filers:  filers,
-	}
+	}, nil
 }
 
 func (c *Client) Master() *Master {
 	return c.master
 }
 
-func (c *Client) Volume(volumeId, collection string) (*Volume, error) {
-	vid, _ := strconv.ParseUint(volumeId, 10, 32)
-	if vid == 0 {
-		fid, _ := ParseFid(volumeId)
-		vid = fid.Id
-	}
+func (c *Client) Volume(id, collection, dc string) (*Volume, error) {
+    fid, err := ParseFid(id)
+    if err != nil {
+        return nil, err
+    }
 
-	if vid == 0 {
-		return nil, errors.New("id malformed")
-	}
-
-	if v, ok := c.volumes[vid]; ok {
-		return v, nil
-	}
-	vol, err := c.Master().lookup(volumeId, collection)
+    volumeId := strconv.FormatUint(fid.Id, 10)
+	vol, err := c.Master().Lookup(volumeId, collection, dc)
 	if err != nil {
 		return nil, err
 	}
-
-	c.volumes[vid] = vol
-
 	return vol, nil
 }
 
@@ -104,28 +93,12 @@ func ParseFid(s string) (fid Fid, err error) {
 	return
 }
 
-// First, contact with master server and assign a fid, then upload to volume server
-// It is same as the follow steps
-// curl http://localhost:9333/dir/assign
-// curl -F file=@example.jpg http://127.0.0.1:8080/3,01637037d6
-func AssignUpload(filename, mimeType string, file io.Reader) (fid string, size int64, err error) {
-	return AssignUploadArgs(filename, mimeType, file, url.Values{})
-}
-
-func AssignUploadArgs(filename, mimeType string, file io.Reader, args url.Values) (fid string, size int64, err error) {
-	return defaultClient.AssignUploadArgs(filename, mimeType, file, args)
-}
-
-func Delete(fid string, count int) (err error) {
-	return defaultClient.Delete(fid, count)
-}
-
 func (c *Client) GetUrl(fid string, collection ...string) (publicUrl, url string, err error) {
 	col := ""
 	if len(collection) > 0 {
 		col = collection[0]
 	}
-	vol, err := c.Volume(fid, col)
+	vol, err := c.Volume(fid, col, "")
 	if err != nil {
 		return
 	}
@@ -135,6 +108,7 @@ func (c *Client) GetUrl(fid string, collection ...string) (publicUrl, url string
 	return
 }
 
+/*
 func (c *Client) GetUrls(fid string, collection ...string) (locations []Location, err error) {
 	col := ""
 	if len(collection) > 0 {
@@ -151,6 +125,7 @@ func (c *Client) GetUrls(fid string, collection ...string) (locations []Location
 	}
 	return
 }
+*/
 
 func (c *Client) AssignUpload(filename, mimeType string, file io.Reader) (fid string, size int64, err error) {
 	return c.AssignUploadArgs(filename, mimeType, file, url.Values{})
@@ -162,7 +137,7 @@ func (c *Client) AssignUploadArgs(filename, mimeType string, file io.Reader, arg
 		return
 	}
 
-	vol, err := c.Volume(fid, args.Get("collection"))
+	vol, err := c.Volume(fid, args.Get("collection"), "")
 	if err != nil {
 		return
 	}
@@ -176,7 +151,7 @@ func (c *Client) Delete(fid string, count int, collection ...string) (err error)
 	if len(collection) > 0 {
 		col = collection[0]
 	}
-	vol, err := c.Volume(fid, col)
+	vol, err := c.Volume(fid, col, "")
 	if err != nil {
 		return
 	}
@@ -226,11 +201,10 @@ func makeFormData(filename, mimeType string, content io.Reader) (formData io.Rea
 }
 
 type uploadResp struct {
-	Fid      string
-	FileName string
-	FileUrl  string
-	Size     int64
-	Error    string
+    Fid  string `json:"fid"`
+    Url  string `json:"url"`
+    Name string `json:"name"`
+    Size int64  `json:"size"`
 }
 
 func upload(url string, contentType string, formData io.Reader) (r *uploadResp, err error) {
@@ -243,11 +217,6 @@ func upload(url string, contentType string, formData io.Reader) (r *uploadResp, 
 
 	upload := new(uploadResp)
 	if err = decodeJson(resp.Body, upload); err != nil {
-		return
-	}
-
-	if upload.Error != "" {
-		err = errors.New(upload.Error)
 		return
 	}
 
